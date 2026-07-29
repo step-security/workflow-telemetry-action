@@ -15,7 +15,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
-      - run: npm install
+      - run: npm ci
       - run: npm run all
       - name: Verify no unstage changes
         run: tests/verify-no-unstaged-changes.sh
