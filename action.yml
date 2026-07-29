@@ -27,7 +27,7 @@ inputs:
     default: "100"
     required: false
   proc_trace_table_show:
-    description: "Enables showing traced processes in trace table. Defaults to 'false'."
+    description: "Enables showing traced processes in trace table including full command-line arguments. WARNING: may expose secrets passed as CLI arguments to processes, as GitHub secret masking does not apply to process-level argument capture. Defaults to 'false'."
     default: "false"
     required: false
   comment_on_pr:
@@ -41,6 +41,10 @@ inputs:
   theme:
     description: "Set to `dark` to generate charts compatible with Github dark mode. Defaults to 'light'."
     default: "light"
+    required: false
+  save_charts:
+    description: "Set to `false` to skip sending metric data to api.globadge.com for chart image generation. Defaults to 'true'."
+    default: "true"
     required: false
 
 runs:

@@ -111635,6 +111635,7 @@ function triggerStatCollect() {
 }
 function reportWorkflowMetrics() {
     return __awaiter(this, void 0, void 0, function* () {
+        const saveCharts = core.getInput('save_charts', { required: false }) === 'true';
         const theme = core.getInput('theme', { required: false });
         let axisColor = BLACK;
         switch (theme) {
@@ -111652,7 +111653,11 @@ function reportWorkflowMetrics() {
         const { networkReadX, networkWriteX } = yield getNetworkStats();
         const { diskReadX, diskWriteX } = yield getDiskStats();
         const { diskAvailableX, diskUsedX } = yield getDiskSizeStats();
-        const cpuLoad = userLoadX && userLoadX.length && systemLoadX && systemLoadX.length
+        const cpuLoad = saveCharts &&
+            userLoadX &&
+            userLoadX.length &&
+            systemLoadX &&
+            systemLoadX.length
             ? yield getStackedAreaGraph({
                 label: 'CPU Load (%)',
                 axisColor,
@@ -111670,7 +111675,8 @@ function reportWorkflowMetrics() {
                 ]
             })
             : null;
-        const memoryUsage = activeMemoryX &&
+        const memoryUsage = saveCharts &&
+            activeMemoryX &&
             activeMemoryX.length &&
             availableMemoryX &&
             availableMemoryX.length
@@ -111691,7 +111697,7 @@ function reportWorkflowMetrics() {
                 ]
             })
             : null;
-        const networkIORead = networkReadX && networkReadX.length
+        const networkIORead = saveCharts && networkReadX && networkReadX.length
             ? yield getLineGraph({
                 label: 'Network I/O Read (MB)',
                 axisColor,
@@ -111702,7 +111708,7 @@ function reportWorkflowMetrics() {
                 }
             })
             : null;
-        const networkIOWrite = networkWriteX && networkWriteX.length
+        const networkIOWrite = saveCharts && networkWriteX && networkWriteX.length
             ? yield getLineGraph({
                 label: 'Network I/O Write (MB)',
                 axisColor,
@@ -111713,7 +111719,7 @@ function reportWorkflowMetrics() {
                 }
             })
             : null;
-        const diskIORead = diskReadX && diskReadX.length
+        const diskIORead = saveCharts && diskReadX && diskReadX.length
             ? yield getLineGraph({
                 label: 'Disk I/O Read (MB)',
                 axisColor,
@@ -111724,7 +111730,7 @@ function reportWorkflowMetrics() {
                 }
             })
             : null;
-        const diskIOWrite = diskWriteX && diskWriteX.length
+        const diskIOWrite = saveCharts && diskWriteX && diskWriteX.length
             ? yield getLineGraph({
                 label: 'Disk I/O Write (MB)',
                 axisColor,
@@ -111735,7 +111741,11 @@ function reportWorkflowMetrics() {
                 }
             })
             : null;
-        const diskSizeUsage = diskUsedX && diskUsedX.length && diskAvailableX && diskAvailableX.length
+        const diskSizeUsage = saveCharts &&
+            diskUsedX &&
+            diskUsedX.length &&
+            diskAvailableX &&
+            diskAvailableX.length
             ? yield getStackedAreaGraph({
                 label: 'Disk Usage (MB)',
                 axisColor,

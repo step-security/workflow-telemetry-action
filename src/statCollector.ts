@@ -38,6 +38,8 @@ async function triggerStatCollect(): Promise<void> {
 }
 
 async function reportWorkflowMetrics(): Promise<string> {
+  const saveCharts: boolean =
+    core.getInput('save_charts', { required: false }) === 'true'
   const theme: string = core.getInput('theme', { required: false })
   let axisColor = BLACK
   switch (theme) {
@@ -58,7 +60,11 @@ async function reportWorkflowMetrics(): Promise<string> {
   const { diskAvailableX, diskUsedX } = await getDiskSizeStats()
 
   const cpuLoad =
-    userLoadX && userLoadX.length && systemLoadX && systemLoadX.length
+    saveCharts &&
+    userLoadX &&
+    userLoadX.length &&
+    systemLoadX &&
+    systemLoadX.length
       ? await getStackedAreaGraph({
           label: 'CPU Load (%)',
           axisColor,
@@ -78,6 +84,7 @@ async function reportWorkflowMetrics(): Promise<string> {
       : null
 
   const memoryUsage =
+    saveCharts &&
     activeMemoryX &&
     activeMemoryX.length &&
     availableMemoryX &&
@@ -101,7 +108,7 @@ async function reportWorkflowMetrics(): Promise<string> {
       : null
 
   const networkIORead =
-    networkReadX && networkReadX.length
+    saveCharts && networkReadX && networkReadX.length
       ? await getLineGraph({
           label: 'Network I/O Read (MB)',
           axisColor,
@@ -114,7 +121,7 @@ async function reportWorkflowMetrics(): Promise<string> {
       : null
 
   const networkIOWrite =
-    networkWriteX && networkWriteX.length
+    saveCharts && networkWriteX && networkWriteX.length
       ? await getLineGraph({
           label: 'Network I/O Write (MB)',
           axisColor,
@@ -127,7 +134,7 @@ async function reportWorkflowMetrics(): Promise<string> {
       : null
 
   const diskIORead =
-    diskReadX && diskReadX.length
+    saveCharts && diskReadX && diskReadX.length
       ? await getLineGraph({
           label: 'Disk I/O Read (MB)',
           axisColor,
@@ -140,7 +147,7 @@ async function reportWorkflowMetrics(): Promise<string> {
       : null
 
   const diskIOWrite =
-    diskWriteX && diskWriteX.length
+    saveCharts && diskWriteX && diskWriteX.length
       ? await getLineGraph({
           label: 'Disk I/O Write (MB)',
           axisColor,
@@ -153,7 +160,11 @@ async function reportWorkflowMetrics(): Promise<string> {
       : null
 
   const diskSizeUsage =
-    diskUsedX && diskUsedX.length && diskAvailableX && diskAvailableX.length
+    saveCharts &&
+    diskUsedX &&
+    diskUsedX.length &&
+    diskAvailableX &&
+    diskAvailableX.length
       ? await getStackedAreaGraph({
           label: 'Disk Usage (MB)',
           axisColor,
