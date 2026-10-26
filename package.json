@@ -33,7 +33,7 @@
   "author": "step-security",
   "license": "MIT",
   "dependencies": {
-    "@actions/core": "^2.0.0",
+    "@actions/core": "^3.0.1",
     "@actions/github": "^8.0.0",
     "@octokit/action": "^8.0.0",
     "@octokit/openapi-types": "^14.0.0",
