@@ -44739,7 +44739,7 @@ RedirectableRequest.prototype._sanitizeOptions = function (options) {
     }
   }
   // Ensure sensitive headers are always present
-  if (!isArray(options.sensitiveHeaders)) {
+  if (!Array.isArray(options.sensitiveHeaders)) {
     options.sensitiveHeaders = [];
   }
 
@@ -45115,10 +45115,6 @@ function isSubdomain(subdomain, domain) {
   assert(isString(subdomain) && isString(domain));
   var dot = subdomain.length - domain.length - 1;
   return dot > 0 && subdomain[dot] === "." && subdomain.endsWith(domain);
-}
-
-function isArray(value) {
-  return value instanceof Array;
 }
 
 function isString(value) {
@@ -77876,7 +77872,7 @@ function parseAudioType(str, input, output) {
   if (str.indexOf('mikr') >= 0) {
     result = 'Microphone';
   }
-  if (str.indexOf('phone') >= 0) {
+  if (str.indexOf('phone') >= 0 && str.indexOf('headphone') < 0) {
     result = 'Phone';
   }
   if (str.indexOf('controll') >= 0) {
@@ -77921,6 +77917,51 @@ function getLinuxAudioPci() {
   } catch {
     return result;
   }
+}
+
+// ARM boards (e.g. Raspberry Pi) have no PCI bus at all - ALSA lists the sound cards instead (#545)
+function parseLinuxAudioAlsa(stdout) {
+  const result = [];
+  const parts = stdout.split('--pcm--');
+  const cards = parts[0] || '';
+  const pcms = parts[1] || '';
+  const lines = cards.split('\n');
+  lines.forEach((line, i) => {
+    // ' 1 [Device         ]: USB-Audio - USB Audio Device'
+    const card = line.match(/^\s*(\d+)\s+\[(.+?)\s*\]:\s*(.*)$/);
+    if (card && card[3].trim()) {
+      const index = card[1];
+      // some drivers (e.g. bcm2835) print an unterminated driver string, gluing the name to it
+      const sep = card[3].lastIndexOf(' - ');
+      const name = (sep >= 0 ? card[3].substring(sep + 3) : card[3]).trim();
+      let driver = (sep >= 0 ? card[3].substring(0, sep) : '').trim();
+      if (name && driver.endsWith(name)) {
+        driver = driver.substring(0, driver.length - name.length).trim();
+      }
+      // second line holds the long name, which is prefixed with the manufacturer on USB devices
+      const longName = (lines[i + 1] || '').trim();
+      const manufacturer = longName.indexOf(name) > 0 ? longName.substring(0, longName.indexOf(name)).trim() : '';
+      const devices = pcms.split('\n').filter((pcm) => pcm.indexOf('/card' + index + '/pcm') >= 0);
+      const out = devices.some((pcm) => pcm.trim().endsWith('p'));
+      const isIn = devices.some((pcm) => pcm.trim().endsWith('c'));
+      const usb = (driver + ' ' + longName).toLowerCase().indexOf('usb') >= 0;
+      const hdmi = (card[2] + ' ' + name).toLowerCase().indexOf('hdmi') >= 0;
+      result.push({
+        id: 'hw:' + index,
+        name,
+        manufacturer,
+        revision: null,
+        driver,
+        default: null,
+        channel: usb ? 'USB' : hdmi ? 'HDMI' : 'Onboard',
+        type: parseAudioType(name, isIn, out),
+        in: devices.length ? isIn : null,
+        out: devices.length ? out : null,
+        status: 'online'
+      });
+    }
+  });
+  return result;
 }
 
 function parseWinAudioStatus(n) {
@@ -78043,10 +78084,23 @@ function audio(callback) {
               }
             });
           }
-          if (callback) {
-            callback(result);
+          if (!result.length) {
+            const cmdAlsa = 'cat /proc/asound/cards 2>/dev/null; echo "--pcm--"; ls -d /proc/asound/card*/pcm* 2>/dev/null';
+            exec(cmdAlsa, util.execOptsLinux, (error, stdout) => {
+              if (!error) {
+                parseLinuxAudioAlsa(stdout.toString()).forEach((item) => result.push(item));
+              }
+              if (callback) {
+                callback(result);
+              }
+              resolve(result);
+            });
+          } else {
+            if (callback) {
+              callback(result);
+            }
+            resolve(result);
           }
-          resolve(result);
         });
       }
       if (_darwin) {
@@ -78135,7 +78189,7 @@ const _sunos = _platform === 'sunos';
 
 function parseWinBatteryPart(lines, designedCapacity, fullChargeCapacity) {
   const result = {};
-  let status = parseInt(util.getValue(lines, 'BatteryStatus', ':').trim(), 10) || 0;
+  const status = parseInt(util.getValue(lines, 'BatteryStatus', ':').trim(), 10) || 0;
   // let status = util.getValue(lines, 'BatteryStatus', ':').trim();
   // 1 = "Discharging"
   // 2 = "On A/C"
@@ -78217,7 +78271,7 @@ module.exports = (callback) =>
         if (battery_path) {
           fs.readFile(battery_path + 'uevent', (error, stdout) => {
             if (!error) {
-              let lines = stdout.toString().split('\n');
+              const lines = stdout.toString().split('\n');
 
               result.isCharging = util.getValue(lines, 'POWER_SUPPLY_STATUS', '=').toLowerCase() === 'charging';
               result.acConnected = acConnected || result.isCharging;
@@ -78282,7 +78336,7 @@ module.exports = (callback) =>
       }
       if (_freebsd || _openbsd || _netbsd) {
         exec('sysctl -i hw.acpi.battery hw.acpi.acline', (error, stdout) => {
-          let lines = stdout.toString().split('\n');
+          const lines = stdout.toString().split('\n');
           const batteries = parseInt('0' + util.getValue(lines, 'hw.acpi.battery.units'), 10);
           const percent = parseInt('0' + util.getValue(lines, 'hw.acpi.battery.life'), 10);
           result.hasBattery = batteries > 0;
@@ -78302,24 +78356,45 @@ module.exports = (callback) =>
 
       if (_darwin) {
         exec(
-          'ioreg -n AppleSmartBattery -r | egrep "CycleCount|IsCharging|DesignCapacity|MaxCapacity|CurrentCapacity|DeviceName|BatterySerialNumber|Serial|TimeRemaining|Voltage"; pmset -g batt | grep %',
+          'ioreg -n AppleSmartBattery -r | egrep "CycleCount|IsCharging|DesignCapacity|MaxCapacity|CurrentCapacity|DeviceName|BatterySerialNumber|Serial|TimeRemaining|Voltage|BatteryData|NominalChargeCapacity"; pmset -g batt | grep %',
           (error, stdout) => {
             if (stdout) {
-              let lines = stdout.toString().replace(/ +/g, '').replace(/"+/g, '').replace(/-/g, '').split('\n');
+              const lines = stdout
+                .toString()
+                .replace(/^[ |]+/gm, '')
+                .replace(/ +/g, '')
+                .replace(/"+/g, '')
+                .replace(/-/g, '')
+                .split('\n');
+              const voltage = parseInt('0' + util.getValue(lines, 'voltage', '='), 10) / 1000.0;
+              const batteryData = util.getValue(lines, 'BatteryData', '=').replace(/^\{/, '').replace(/\}$/, '').split(',');
+              const maxCapacity = Math.round(
+                parseInt(
+                  '0' +
+                    (util.getValue(lines, 'AppleRawMaxCapacity', '=') ||
+                      util.getValue(lines, 'NominalChargeCapacity', '=') ||
+                      util.getValue(batteryData, 'FullChargeCapacity', '=') ||
+                      util.getValue(batteryData, 'NominalChargeCapacity', '=')),
+                  10
+                ) * (voltage || 1)
+              );
+              const currentCapacity = Math.round(parseInt('0' + (util.getValue(lines, 'AppleRawCurrentCapacity', '=') || util.getValue(batteryData, 'RemainingCapacity', '=')), 10) * (voltage || 1));
+              const designedCapacity = Math.round(parseInt('0' + (util.getValue(lines, 'DesignCapacity', '=') || util.getValue(batteryData, 'DesignCapacity', '=')), 10) * (voltage || 1));
+
               result.cycleCount = parseInt('0' + util.getValue(lines, 'cyclecount', '='), 10);
-              result.voltage = parseInt('0' + util.getValue(lines, 'voltage', '='), 10) / 1000.0;
+              result.voltage = voltage;
               result.capacityUnit = result.voltage ? 'mWh' : 'mAh';
-              result.maxCapacity = Math.round(parseInt('0' + util.getValue(lines, 'applerawmaxcapacity', '='), 10) * (result.voltage || 1));
-              result.currentCapacity = Math.round(parseInt('0' + util.getValue(lines, 'applerawcurrentcapacity', '='), 10) * (result.voltage || 1));
-              result.designedCapacity = Math.round(parseInt('0' + util.getValue(lines, 'DesignCapacity', '='), 10) * (result.voltage || 1));
+              result.maxCapacity = maxCapacity;
+              result.currentCapacity = currentCapacity;
+              result.designedCapacity = designedCapacity;
               result.manufacturer = 'Apple';
               result.serial = util.getValue(lines, 'BatterySerialNumber', '=') || util.getValue(lines, 'Serial', '=');
               result.model = util.getValue(lines, 'DeviceName', '=');
               let percent = null;
               const line = util.getValue(lines, 'internal', 'Battery');
-              let parts = line.split(';');
+              const parts = line.split(';');
               if (parts && parts[0]) {
-                let parts2 = parts[0].split('\t');
+                const parts2 = parts[0].split('\t');
                 if (parts2 && parts2[1]) {
                   percent = parseFloat(parts2[1].trim().replace(/%/g, ''));
                 }
@@ -79975,7 +80050,7 @@ let _current_cpu = {
   rawCurrentLoadSteal: 0,
   rawCurrentLoadGuest: 0
 };
-let _cpus = [];
+const _cpus = [];
 let _corecount = 0;
 
 const AMDBaseFrequencies = {
@@ -80760,7 +80835,7 @@ function cpuBrandManufacturer(res) {
   res.brand = res.brand.replace(/CPU+/g, '').replace(/\s+/g, ' ').trim();
   res.manufacturer = cpuManufacturer(res.brand);
 
-  let parts = res.brand.split(' ');
+  const parts = res.brand.split(' ');
   parts.shift();
   res.brand = parts.join(' ');
   return res;
@@ -80768,9 +80843,9 @@ function cpuBrandManufacturer(res) {
 
 function getAMDSpeed(brand) {
   let result = '0';
-  for (let key in AMDBaseFrequencies) {
+  for (const key in AMDBaseFrequencies) {
     if ({}.hasOwnProperty.call(AMDBaseFrequencies, key)) {
-      let parts = key.split('|');
+      const parts = key.split('|');
       let found = 0;
       parts.forEach((item) => {
         if (brand.indexOf(item) > -1) {
@@ -81057,8 +81132,8 @@ function getCpu() {
             workload.push(util.powerShell('(Get-CimInstance Win32_ComputerSystem).HypervisorPresent'));
 
             Promise.all(workload).then((data) => {
-              let lines = data[0].split('\r\n');
-              let name = util.getValue(lines, 'name', ':') || '';
+              const lines = data[0].split('\r\n');
+              const name = util.getValue(lines, 'name', ':') || '';
               if (name.indexOf('@') >= 0) {
                 result.brand = name.split('@')[0].trim();
                 result.speed = name.split('@')[1] ? parseFloat(name.split('@')[1].trim()) : 0;
@@ -81079,7 +81154,7 @@ function getCpu() {
               }
               result.speedMin = result.speed;
 
-              let description = util.getValue(lines, 'description', ':').split(' ');
+              const description = util.getValue(lines, 'description', ':').split(' ');
               for (let i = 0; i < description.length; i++) {
                 if (description[i].toLowerCase().startsWith('family') && i + 1 < description.length && description[i + 1]) {
                   result.family = description[i + 1];
@@ -81159,8 +81234,8 @@ function getCpuCurrentSpeedSync() {
   const cores = [];
   const speeds = [];
 
-  if (cpus && cpus.length && Object.prototype.hasOwnProperty.call(cpus[0], 'speed')) {
-    for (let i in cpus) {
+  if (cpus && cpus.length && {}.hasOwnProperty.call(cpus[0], 'speed')) {
+    for (const i in cpus) {
       speeds.push(cpus[i].speed > 100 ? (cpus[i].speed + 1) / 1000 : cpus[i].speed / 10);
     }
   } else if (_linux) {
@@ -81169,7 +81244,7 @@ function getCpuCurrentSpeedSync() {
         .toString()
         .split('\n')
         .filter((line) => line.length > 0);
-      for (let i in speedStrings) {
+      for (const i in speedStrings) {
         speeds.push(Math.floor(parseInt(speedStrings[i], 10) / 10) / 100);
       }
     } catch {
@@ -81269,7 +81344,7 @@ function cpuTemperature(callback) {
                 result.chipset = Math.round(parseInt(lines2[i], 10) / 100) / 10;
               }
               // CPU thermal zone (e.g. cpu-thermal on Raspberry Pi)
-              if (cpuThermal === null && line.indexOf('cpu') !== -1 && lines2[i]) {
+              if (cpuThermal === null && line.toLowerCase().indexOf('cpu') !== -1 && lines2[i]) {
                 cpuThermal = Math.round(parseInt(lines2[i], 10) / 100) / 10;
               }
             }
@@ -81310,7 +81385,7 @@ function cpuTemperature(callback) {
               if (result.main === null) {
                 result.main = Math.round(result.cores.reduce((a, b) => a + b, 0) / result.cores.length);
               }
-              let maxtmp = Math.max.apply(Math, result.cores);
+              const maxtmp = Math.max.apply(Math, result.cores);
               result.max = maxtmp > result.main ? maxtmp : result.main;
             }
             if (result.main !== null) {
@@ -81580,13 +81655,13 @@ function cpuFlags(callback) {
         try {
           exec('reg query "HKEY_LOCAL_MACHINE\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0" /v FeatureSet', util.execOptsWin, (error, stdout) => {
             if (!error) {
-              let flag_hex = stdout.split('0x').pop().trim();
-              let flag_bin_unpadded = parseInt(flag_hex, 16).toString(2);
-              let flag_bin = '0'.repeat(32 - flag_bin_unpadded.length) + flag_bin_unpadded;
+              const flag_hex = stdout.split('0x').pop().trim();
+              const flag_bin_unpadded = parseInt(flag_hex, 16).toString(2);
+              const flag_bin = '0'.repeat(32 - flag_bin_unpadded.length) + flag_bin_unpadded;
               // empty flags are the reserved fields in the CPUID feature bit list
               // as found on wikipedia:
               // https://en.wikipedia.org/wiki/CPUID
-              let all_flags = [
+              const all_flags = [
                 'fpu',
                 'vme',
                 'de',
@@ -81643,7 +81718,7 @@ function cpuFlags(callback) {
         try {
           exec('export LC_ALL=C; lscpu; unset LC_ALL', (error, stdout) => {
             if (!error) {
-              let lines = stdout.toString().split('\n');
+              const lines = stdout.toString().split('\n');
               lines.forEach((line) => {
                 if (line.split(':')[0].toUpperCase().indexOf('FLAGS') !== -1) {
                   result = line.split(':')[1].trim().toLowerCase();
@@ -81653,7 +81728,7 @@ function cpuFlags(callback) {
             if (!result) {
               fs.readFile('/proc/cpuinfo', (error, stdout) => {
                 if (!error) {
-                  let lines = stdout.toString().split('\n');
+                  const lines = stdout.toString().split('\n');
                   result = util.getValue(lines, 'features', ':', true).toLowerCase();
                 }
                 if (callback) {
@@ -81698,7 +81773,7 @@ function cpuFlags(callback) {
       if (_darwin) {
         exec('sysctl machdep.cpu.features', (error, stdout) => {
           if (!error) {
-            let lines = stdout.toString().split('\n');
+            const lines = stdout.toString().split('\n');
             if (lines.length > 0 && lines[0].indexOf('machdep.cpu.features:') !== -1) {
               result = lines[0].split(':')[1].trim().toLowerCase();
             }
@@ -81800,9 +81875,9 @@ function cpuCache(callback) {
       if (_darwin) {
         exec('sysctl hw.l1icachesize hw.l1dcachesize hw.l2cachesize hw.l3cachesize', (error, stdout) => {
           if (!error) {
-            let lines = stdout.toString().split('\n');
+            const lines = stdout.toString().split('\n');
             lines.forEach((line) => {
-              let parts = line.split(':');
+              const parts = line.split(':');
               if (parts[0].toLowerCase().indexOf('hw.l1icachesize') !== -1) {
                 result.l1i = parseInt(parts[1].trim()) * (parts[1].indexOf('K') !== -1 ? 1024 : 1);
               }
@@ -81863,7 +81938,7 @@ function parseWinCache(linesProc, linesCache) {
   };
 
   // Win32_processor
-  let lines = linesProc.split('\r\n');
+  const lines = linesProc.split('\r\n');
   result.l1d = 0;
   result.l1i = 0;
   result.l2 = util.getValue(lines, 'l2cachesize', ':');
@@ -81960,7 +82035,7 @@ function getLoad() {
               lines.shift();
               if (lines.length === cpus.length) {
                 for (let i = 0; i < lines.length; i++) {
-                  let parts = lines[i].split(' ');
+                  const parts = lines[i].split(' ');
                   if (parts.length >= 10) {
                     const steal = parseFloat(parts[8]) || 0;
                     const guest = parseFloat(parts[9]) || 0;
@@ -83177,7 +83252,19 @@ function fsSize(drive, callback) {
   }
 
   let macOsDisks = [];
+  const macOsFsTypes = new Map();
   let osMounts = [];
+
+  // macOS df has no type column, so the type used to be guessed from diskutil - which only ever
+  // produced APFS, HFS or NFS and therefore never recognised zfs, exfat, msdos or smbfs. mount
+  // knows the real type, so prefer it and keep the old names for the three it could produce.
+  function macOsFsType(fs) {
+    const type = macOsFsTypes.get(fs);
+    if (!type) {
+      return getmacOsFsType(fs);
+    }
+    return type === 'apfs' ? 'APFS' : type === 'hfs' ? 'HFS' : type === 'nfs' ? 'NFS' : type;
+  }
 
   function getmacOsFsType(fs) {
     if (!fs.startsWith('/')) {
@@ -83220,6 +83307,59 @@ function fsSize(drive, callback) {
     return lines;
   }
 
+  // ZFS datasets share the pool, so df only reports what a dataset references itself - a parent
+  // holding its data in child datasets looks empty (#1017). Only `zfs list` knows the
+  // hierarchical usage, so query it once when a zfs mount is present.
+  function applyZfsUsage(data, cb) {
+    if (!data.some((item) => item.type === 'zfs')) {
+      return cb(data);
+    }
+    exec('zfs list -H -p -o name,used,avail,mountpoint', { ...util.execOptsLinux, timeout: 5000 }, (error, stdout) => {
+      if (error) {
+        // a truncated or timed out listing would correct only part of the datasets and leave the
+        // rest on their df values - correct none instead, so the result stays consistent
+        return cb(data);
+      }
+      const byMount = Object.create(null);
+      const byName = Object.create(null);
+      (stdout || '')
+        .toString()
+        .split('\n')
+        .forEach((line) => {
+          const parts = line.split('\t');
+          if (parts.length < 4) {
+            return;
+          }
+          const entry = { used: parseInt(parts[1], 10), available: parseInt(parts[2], 10) };
+          if (isNaN(entry.used) || isNaN(entry.available)) {
+            return;
+          }
+          byName[parts[0]] = entry;
+          const mount = parts[3].trim();
+          // several datasets can carry the same mountpoint (root-on-zfs boot environments all
+          // declare "/"), so the mount index is only a fallback - keep the first one
+          if (mount.startsWith('/') && !byMount[mount]) {
+            byMount[mount] = entry;
+          }
+        });
+      data.forEach((item) => {
+        if (item.type !== 'zfs') {
+          return;
+        }
+        // the fs column is the exact dataset name and therefore unambiguous, unlike the mountpoint
+        const dataset = byName[item.fs] || byMount[item.mount];
+        if (!dataset || !(dataset.used + dataset.available)) {
+          return;
+        }
+        item.used = dataset.used;
+        item.available = dataset.available;
+        item.size = dataset.used + dataset.available;
+        item.use = parseFloat(((100.0 * dataset.used) / item.size).toFixed(2));
+      });
+      cb(data);
+    });
+  }
+
   function parseDf(lines) {
     const data = [];
     // filesystem (first column) and mount point (last column) may contain spaces:
@@ -83232,7 +83372,7 @@ function fsSize(drive, callback) {
         const parts = line.trim().match(hasType ? dfWithType : dfNoType);
         if (parts && (parts[1].startsWith('/') || parts[hasType ? 6 : 5] === '/' || parts[1].indexOf('/') > 0 || parts[1].indexOf(':') === 1 || (!_darwin && !isLinuxTmpFs(parts[2])))) {
           const fs = parts[1];
-          const fsType = hasType ? parts[2] : getmacOsFsType(parts[1]);
+          const fsType = hasType ? parts[2] : macOsFsType(parts[1]);
           const size = parseInt(parts[hasType ? 3 : 2], 10) * 1024;
           const used = parseInt(parts[hasType ? 4 : 3], 10) * 1024;
           const available = parseInt(parts[hasType ? 5 : 4], 10) * 1024;
@@ -83276,11 +83416,16 @@ function fsSize(drive, callback) {
             execSync('mount')
               .toString()
               .split('\n')
-              .filter((line) => {
-                return line.startsWith('/');
-              })
               .forEach((line) => {
-                osMounts[line.split(' ')[0]] = line.toLowerCase().indexOf('read-only') === -1;
+                // mount output: "<fs> on <mountpoint> (<type>, <options>)"
+                const fs = line.split(' ')[0];
+                const type = line.match(/\(([^),]+)[^)]*\)$/);
+                if (fs && type) {
+                  macOsFsTypes.set(fs, type[1].trim().toLowerCase());
+                }
+                if (line.startsWith('/')) {
+                  osMounts[fs] = line.toLowerCase().indexOf('read-only') === -1;
+                }
               });
           } catch {
             util.noop();
@@ -83325,23 +83470,28 @@ function fsSize(drive, callback) {
           data = parseDf(lines);
           if (drive) {
             data = data.filter((item) => {
-              return item.fs.toLowerCase().indexOf(drive.toLowerCase()) >= 0 || item.mount.toLowerCase().indexOf(drive.toLowerCase()) >= 0;
+              // non-string drive input matches no drive (same as windows)
+              return typeof drive === 'string' && (item.fs.toLowerCase().indexOf(drive.toLowerCase()) >= 0 || item.mount.toLowerCase().indexOf(drive.toLowerCase()) >= 0);
             });
           }
           if ((!error || data.length) && stdout.toString().trim() !== '') {
-            if (callback) {
-              callback(data);
-            }
-            resolve(data);
+            applyZfsUsage(data, (data) => {
+              if (callback) {
+                callback(data);
+              }
+              resolve(data);
+            });
           } else {
             exec('df -kPT 2>/dev/null', { maxBuffer: 1024 * 1024 }, (error, stdout) => {
               // fixed issue alpine fallback
               const lines = filterLines(stdout);
               data = parseDf(lines);
-              if (callback) {
-                callback(data);
-              }
-              resolve(data);
+              applyZfsUsage(data, (data) => {
+                if (callback) {
+                  callback(data);
+                }
+                resolve(data);
+              });
             });
           }
         });
@@ -83354,8 +83504,9 @@ function fsSize(drive, callback) {
       }
       if (_windows) {
         try {
-          const driveSanitized = drive ? util.sanitizeString(drive, true) : '';
-          const cmd = `Get-WmiObject Win32_logicaldisk | select Access,Caption,FileSystem,FreeSpace,Size ${driveSanitized ? '| where -property Caption -eq ' + driveSanitized : ''} | fl`;
+          // invalid drive input yields '' -> filter matches no drive instead of listing all
+          const driveSanitized = util.sanitizeDriveLetter(drive);
+          const cmd = `Get-WmiObject Win32_logicaldisk | select Access,Caption,FileSystem,FreeSpace,Size ${drive ? "| where -property Caption -eq '" + driveSanitized + "'" : ''} | fl`;
           util.powerShell(cmd).then((stdout, error) => {
             if (!error) {
               const devices = stdout.toString().split(/\n\s*\n/);
@@ -83626,7 +83777,9 @@ function raidMatchLinux(data) {
   try {
     data.forEach((element) => {
       if (element.type.startsWith('raid')) {
-        const lines = execSync(`mdadm --export --detail /dev/${util.sanitizeString(element.name, true)}`, util.execOptsLinux).toString().split('\n');
+        const lines = execSync(`mdadm --export --detail /dev/${util.sanitizeString(element.name, true)}`, util.execOptsLinux)
+          .toString()
+          .split('\n');
         const mdData = decodeMdabmData(lines);
 
         element.label = mdData.label; // <- assign label info
@@ -84493,7 +84646,7 @@ function diskLayout(callback) {
       }
       if (_darwin) {
         let cmdFullSmart = '';
-        exec(`system_profiler SPSerialATADataType SPNVMeDataType SPUSBDataType SPStorageDataType`, { maxBuffer: 1024 * 1024 }, (error, stdout) => {
+        exec(`system_profiler SPSerialATADataType SPNVMeDataType SPUSBDataType SPUSBHostDataType SPStorageDataType`, { maxBuffer: 1024 * 1024 }, (error, stdout) => {
           if (!error) {
             // split by type:
             const lines = stdout.toString().split('\n');
@@ -84632,9 +84785,12 @@ function diskLayout(callback) {
             } catch {
               util.noop();
             }
-            // USB Drives (older macOS report storage devices under SPUSBDataType)
+            // USB Drives (SPUSBDataType up to macOS 26, SPUSBHostDataType from macOS 27 on)
             try {
-              const devices = linesUSB.join('\n').replace(/Media:\n /g, 'Model:').split('\n\n          Product ID:');
+              const devices = linesUSB
+                .join('\n')
+                .replace(/Media:\n /g, 'Model:')
+                .split('\n\n          Product ID:');
               devices.shift();
               devices.forEach((device) => {
                 const lines = device.split('\n');
@@ -84856,6 +85012,10 @@ function diskLayout(callback) {
               const smartDev = JSON.parse(execSync('smartctl --scan -j').toString());
               if (smartDev && smartDev.devices && smartDev.devices.length > 0) {
                 smartDev.devices.forEach((dev) => {
+                  // device names come from smartctl output - never let anything but a plain path reach the shell
+                  if (!/^[\w/.,:\\-]+$/.test(String(dev.name || ''))) {
+                    return;
+                  }
                   workload.push(execPromiseSave(`smartctl -j -a ${dev.name}`, util.execOptsWin));
                 });
               }
@@ -84863,12 +85023,29 @@ function diskLayout(callback) {
               util.noop();
             }
           }
+          function hasControlCharacters(str) {
+            return /\p{Cc}/u.test(str);
+          }
           util.promiseAll(workload).then((data) => {
             let devices = data.results[0].toString().split(/\n\s*\n/);
             devices.forEach((device) => {
               const lines = device.split('\r\n');
               const size = util.getValue(lines, 'Size', ':').trim();
               const status = util.getValue(lines, 'Status', ':').trim().toLowerCase();
+              let serialNum = util.getValue(lines, 'SerialNumber', ':').trim();
+              if (hasControlCharacters(serialNum)) {
+                const instanceId = util.getValue(lines, 'PNPDeviceId', ':').trim().split('\\')[2];
+                if (instanceId) {
+                  const parts = instanceId.split('&');
+                  // instanceId can contain device serial number or be generated by PnP manager
+                  // in first case it will be "<serial number>&0"
+                  // in second case it will be opaque generated value that looks like this: "5&<8-symbol hex code>&0&000000"
+                  // https://learn.microsoft.com/en-us/windows-hardware/drivers/install/instance-ids
+                  if (parts.length === 2 && parts[1] === '0') {
+                    serialNum = parts[0];
+                  }
+                }
+              }
               if (size) {
                 result.push({
                   device: util.getValue(lines, 'DeviceId', ':'), // changed from PNPDeviceId to DeviceID (be be able to match devices)
@@ -84884,7 +85061,7 @@ function diskLayout(callback) {
                   tracksPerCylinder: parseInt(util.getValue(lines, 'TracksPerCylinder', ':'), 10),
                   sectorsPerTrack: parseInt(util.getValue(lines, 'SectorsPerTrack', ':'), 10),
                   firmwareRevision: util.getValue(lines, 'FirmwareRevision', ':').trim(),
-                  serialNum: util.getValue(lines, 'SerialNumber', ':').trim(),
+                  serialNum,
                   interfaceType: util.getValue(lines, 'InterfaceType', ':').trim(),
                   smartStatus: status === 'ok' ? 'Ok' : status === 'degraded' ? 'Degraded' : status === 'pred fail' ? 'Predicted Failure' : 'Unknown',
                   temperature: null
@@ -84991,6 +85168,7 @@ const fs = __nccwpck_require__(7147);
 const path = __nccwpck_require__(1017);
 const exec = (__nccwpck_require__(2081).exec);
 const execSync = (__nccwpck_require__(2081).execSync);
+const execFileSync = (__nccwpck_require__(2081).execFileSync);
 const util = __nccwpck_require__(5386);
 
 const _platform = process.platform;
@@ -85201,7 +85379,7 @@ function graphics(callback) {
     // PCI bus IDs
     let pciIDs = [];
     try {
-      pciIDs = execSync('export LC_ALL=C; dmidecode -t 9 2>/dev/null; unset LC_ALL | grep "Bus Address: "', util.execOptsLinux).toString().split('\n');
+      pciIDs = execSync('export LC_ALL=C; dmidecode -t 9 2>/dev/null | grep "Bus Address: "', util.execOptsLinux).toString().split('\n');
       for (let i = 0; i < pciIDs.length; i++) {
         pciIDs[i] = pciIDs[i].replace('Bus Address:', '').replace('0000:', '').trim();
       }
@@ -85455,14 +85633,9 @@ function graphics(callback) {
     if (nvidiaSmiExe) {
       const nvidiaSmiOpts =
         '--query-gpu=driver_version,pci.sub_device_id,name,pci.bus_id,fan.speed,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,temperature.memory,power.draw,power.limit,clocks.gr,clocks.mem --format=csv,noheader,nounits';
-      const cmd = `"${nvidiaSmiExe}" ${nvidiaSmiOpts}`;
-      if (_linux) {
-        options.stdio = ['pipe', 'pipe', 'ignore'];
-      }
+      options.stdio = ['pipe', 'pipe', 'ignore'];
       try {
-        const sanitized = cmd + (_linux ? '  2>/dev/null' : '') + (_windows ? '  2> nul' : '');
-        const res = execSync(sanitized, options).toString();
-        return res;
+        return execFileSync(nvidiaSmiExe, nvidiaSmiOpts.split(' '), options).toString();
       } catch {
         util.noop();
       }
@@ -86452,7 +86625,7 @@ function getDynamicData(srv, iface, callback) {
       srv = srv || '';
 
       // use closure to track ƒ completion
-      let functionProcessed = (() => {
+      const functionProcessed = (() => {
         let totalFunctions = 15;
         if (_windows) {
           totalFunctions = 13;
@@ -86464,7 +86637,7 @@ function getDynamicData(srv, iface, callback) {
           totalFunctions = 6;
         }
 
-        return function () {
+        return () => {
           if (--totalFunctions === 0) {
             if (callback) {
               callback(data);
@@ -86610,7 +86783,7 @@ function getAllData(srv, iface, callback) {
       getStaticData().then((res) => {
         data = res;
         getDynamicData(srv, iface).then((res) => {
-          for (let key in res) {
+          for (const key in res) {
             if ({}.hasOwnProperty.call(res, key)) {
               data[key] = res[key];
             }
@@ -86628,6 +86801,7 @@ function getAllData(srv, iface, callback) {
 function get(valueObject, callback) {
   return new Promise((resolve) => {
     process.nextTick(() => {
+      valueObject = valueObject || {};
       const blocked = ['get', 'getStaticData', 'getDynamicData', 'getAllData', 'observe', 'powerShellStart', 'powerShellRelease'];
       const isGettable = (key) => ({}).hasOwnProperty.call(exports, key) && typeof exports[key] === 'function' && typeof valueObject[key] === 'string' && blocked.indexOf(key) < 0;
       const allPromises = Object.keys(valueObject)
@@ -86636,17 +86810,18 @@ function get(valueObject, callback) {
           const params = valueObject[func].substring(valueObject[func].lastIndexOf('(') + 1, valueObject[func].lastIndexOf(')'));
           let funcWithoutParams = func.indexOf(')') >= 0 ? func.split(')')[1].trim() : func;
           funcWithoutParams = func.indexOf('|') >= 0 ? func.split('|')[0].trim() : funcWithoutParams;
-          if (params) {
-            return exports[funcWithoutParams](params);
-          } else {
-            return exports[funcWithoutParams]('');
+          // a failing function yields an empty result for its key only
+          try {
+            return Promise.resolve(exports[funcWithoutParams](params || '')).catch(() => null);
+          } catch {
+            return Promise.resolve(null);
           }
         });
 
       Promise.all(allPromises).then((data) => {
         const result = {};
         let i = 0;
-        for (let key in valueObject) {
+        for (const key in valueObject) {
           if ({}.hasOwnProperty.call(valueObject, key) && isGettable(key) && data.length > i) {
             if (valueObject[key] === '*' || valueObject[key] === 'all') {
               result[key] = data[i];
@@ -86992,6 +87167,12 @@ function inetLatency(host, callback) {
         hostSanitized.startsWith('news:') ||
         hostSanitized.startsWith('nntp:')
       ) {
+        if (callback) {
+          callback(null);
+        }
+        return resolve(null);
+      }
+      if (hostSanitized.startsWith('-')) {
         if (callback) {
           callback(null);
         }
@@ -87478,11 +87659,9 @@ function memLayout(callback) {
                     bank,
                     type: util.getValue(lines, 'Type:'),
                     ecc: dataWidth && totalWidth ? totalWidth > dataWidth : false,
-                    clockSpeed: util.getValue(lines, 'Configured Clock Speed:')
-                      ? parseInt(util.getValue(lines, 'Configured Clock Speed:'), 10)
-                      : util.getValue(lines, 'Speed:')
-                        ? parseInt(util.getValue(lines, 'Speed:'), 10)
-                        : null,
+                    // dmidecode >= 3.1 renamed "Configured Clock Speed" to "Configured Memory Speed" - without
+                    // the new label this silently fell back to Speed, the rated instead of the running speed
+                    clockSpeed: util.toInt(util.getValue(lines, 'Configured Memory Speed:')) || util.toInt(util.getValue(lines, 'Configured Clock Speed:')) || util.toInt(util.getValue(lines, 'Speed:')) || null,
                     formFactor: util.getValue(lines, 'Form Factor:'),
                     manufacturer: getManufacturer(util.getValue(lines, 'Manufacturer:')),
                     partNum: util.getValue(lines, 'Part Number:'),
@@ -87760,7 +87939,7 @@ const _openbsd = _platform === 'openbsd';
 const _netbsd = _platform === 'netbsd';
 const _sunos = _platform === 'sunos';
 
-const _network = {};
+const _network = Object.create(null);
 let _default_iface = '';
 let _ifaces = {};
 let _dhcpNics = [];
@@ -87777,7 +87956,7 @@ function getDefaultNetworkInterface() {
     let scopeid = 9999;
 
     // fallback - "first" external interface (sorted by scopeid)
-    for (let dev in ifaces) {
+    for (const dev in ifaces) {
       if ({}.hasOwnProperty.call(ifaces, dev)) {
         ifaces[dev].forEach((details) => {
           if (details && details.internal === false) {
@@ -87808,7 +87987,7 @@ function getDefaultNetworkInterface() {
         }
       });
       if (defaultIp) {
-        for (let dev in ifaces) {
+        for (const dev in ifaces) {
           if ({}.hasOwnProperty.call(ifaces, dev)) {
             ifaces[dev].forEach((details) => {
               if (details && details.address && details.address === defaultIp) {
@@ -87931,6 +88110,8 @@ function getMacAddresses() {
   return result;
 }
 
+exports.getMacAddresses = getMacAddresses;
+
 function networkInterfaceDefault(callback) {
   return new Promise((resolve) => {
     process.nextTick(() => {
@@ -87950,7 +88131,7 @@ exports.networkInterfaceDefault = networkInterfaceDefault;
 
 function parseLinesWindowsNics(sections, nconfigsections) {
   const nics = [];
-  for (let i in sections) {
+  for (const i in sections) {
     try {
       if ({}.hasOwnProperty.call(sections, i)) {
         if (sections[i].trim() !== '') {
@@ -88096,8 +88277,8 @@ function getWindowsWiredProfilesInformation() {
 
 function getWindowsWirelessIfaceSSID(interfaceName) {
   try {
-    const result = execSync(`netsh wlan show  interface name="${interfaceName}" | findstr "SSID"`, util.execOptsWin);
-    const SSID = result.split('\r\n').shift();
+    const result = execFileSync('netsh', ['wlan', 'show', 'interface', `name=${util.sanitizeString(interfaceName)}`], util.execOptsWin).toString();
+    const SSID = result.split('\r\n').find((l) => l.includes('SSID')) || '';
     const parseSSID = SSID.split(':').pop().trim();
     return parseSSID;
   } catch {
@@ -88148,7 +88329,7 @@ function getWindowsIEEE8021x(connectionType, iface, ifaces) {
       const SSID = getWindowsWirelessIfaceSSID(iface);
       if (SSID !== 'Unknown') {
         const ifaceSanitized = util.sanitizeString(SSID);
-        const profiles = execSync(`netsh wlan show profiles "${ifaceSanitized}"`, util.execOptsWin).split('\r\n');
+        const profiles = execFileSync('netsh', ['wlan', 'show', 'profiles', ifaceSanitized], util.execOptsWin).toString().split('\r\n');
         i8021xState = (profiles.find((l) => l.indexOf('802.1X') >= 0) || '').trim();
         i8021xProtocol = (profiles.find((l) => l.indexOf('EAP') >= 0) || '').trim();
       }
@@ -88328,7 +88509,7 @@ function parseLinuxDHCPNics(sections) {
       if (lines && lines.length) {
         const parts = lines[0].split(':');
         if (parts.length > 2) {
-          for (let line of lines) {
+          for (const line of lines) {
             if (line.indexOf(' inet ') >= 0 && line.indexOf(' dynamic ') >= 0) {
               const parts2 = line.split(' ');
               const nic = parts2[parts2.length - 1].trim();
@@ -88488,8 +88669,8 @@ function networkInterfaces(callback, rescan, defaultString) {
   if (typeof rescan === 'undefined') {
     rescan = true;
   }
-  defaultString = defaultString || '';
-  defaultString = '' + defaultString;
+  // objects without string conversion would throw here
+  defaultString = typeof defaultString === 'string' ? defaultString : '';
 
   return new Promise((resolve) => {
     process.nextTick(() => {
@@ -88608,7 +88789,7 @@ function networkInterfaces(callback, rescan, defaultString) {
           _ifaces = JSON.parse(JSON.stringify(ifaces));
           _dhcpNics = getLinuxDHCPNics();
           const defaultInterface = getDefaultNetworkInterface();
-          for (let dev in ifaces) {
+          for (const dev in ifaces) {
             let ip4 = '';
             let ip4subnet = '';
             let ip6 = '';
@@ -88671,7 +88852,7 @@ function networkInterfaces(callback, rescan, defaultString) {
                 ip6subnet = ip6linksubnet;
               }
               const iface = dev.split(':')[0].trim();
-              const ifaceSanitized = util.sanitizeString(iface);
+              const ifaceSanitized = util.sanitizeString(iface, true);
               const cmd = `echo -n "addr_assign_type: "; cat /sys/class/net/${ifaceSanitized}/addr_assign_type 2>/dev/null; echo;
             echo -n "address: "; cat /sys/class/net/${ifaceSanitized}/address 2>/dev/null; echo;
             echo -n "addr_len: "; cat /sys/class/net/${ifaceSanitized}/addr_len 2>/dev/null; echo;
@@ -88802,7 +88983,7 @@ function networkInterfaces(callback, rescan, defaultString) {
             });
             nics8021xInfo = getWindowsWiredProfilesInformation();
             dnsSuffixes = getWindowsDNSsuffixes();
-            for (let dev in ifaces) {
+            for (const dev in ifaces) {
               const ifaceSanitized = util.sanitizeString(dev);
 
               let iface = dev;
@@ -88811,10 +88992,10 @@ function networkInterfaces(callback, rescan, defaultString) {
               let ip6 = '';
               let ip6subnet = '';
               let mac = '';
-              let duplex = '';
-              let mtu = '';
+              const duplex = '';
+              const mtu = '';
               let speed = null;
-              let carrierChanges = 0;
+              const carrierChanges = 0;
               let operstate = 'down';
               let dhcp = false;
               let dnsSuffix = '';
@@ -89009,7 +89190,7 @@ function networkStats(ifaces, callback) {
       if (ifacesArray.length && ifacesArray[0].trim() === '*') {
         ifacesArray = [];
         networkInterfaces(false).then((allIFaces) => {
-          for (let iface of allIFaces) {
+          for (const iface of allIFaces) {
             ifacesArray.push(iface.iface);
           }
           networkStats(ifacesArray.join(',')).then((result) => {
@@ -89020,7 +89201,7 @@ function networkStats(ifaces, callback) {
           });
         });
       } else {
-        for (let iface of ifacesArray) {
+        for (const iface of ifacesArray) {
           workload.push(networkStatsSingle(iface.trim()));
         }
         if (workload.length) {
@@ -89044,7 +89225,7 @@ function networkStats(ifaces, callback) {
 function networkStatsSingle(iface) {
   function parseLinesWindowsPerfData(sections) {
     const perfData = [];
-    for (let i in sections) {
+    for (const i in sections) {
       if ({}.hasOwnProperty.call(sections, i)) {
         if (sections[i].trim() !== '') {
           const lines = sections[i].trim().split('\r\n');
@@ -89086,6 +89267,13 @@ function networkStatsSingle(iface) {
         ms: 0
       };
 
+      // an interface name never starts with a dash - passed on to ifconfig / netstat it would be
+      // read as an option instead of as an interface name (index access, so a polluted
+      // String.prototype cannot bypass it)
+      if (ifaceSanitized[0] === '-') {
+        return resolve(result);
+      }
+
       let operstate = 'unknown';
       let rx_bytes = 0;
       let tx_bytes = 0;
@@ -89101,7 +89289,9 @@ function networkStatsSingle(iface) {
         (_network[ifaceSanitized] && _network[ifaceSanitized].ms && Date.now() - _network[ifaceSanitized].ms >= 500)
       ) {
         if (_linux) {
-          if (fs.existsSync('/sys/class/net/' + ifaceSanitized)) {
+          // interface name must stay a single path segment inside /sys/class/net (no traversal)
+          const ifaceIsSegment = ifaceSanitized !== '' && ifaceSanitized !== '.' && ifaceSanitized !== '..' && ifaceSanitized.split('').every((c) => c !== '/');
+          if (ifaceIsSegment && fs.existsSync('/sys/class/net/' + ifaceSanitized)) {
             cmd =
               'cat /sys/class/net/' +
               ifaceSanitized +
@@ -89255,7 +89445,10 @@ function networkStatsSingle(iface) {
                   });
                 });
                 if (rx_bytes && tx_bytes) {
-                  result = calcNetworkSpeed(ifaceName, parseInt(rx_bytes), parseInt(tx_bytes), operstate, rx_dropped, rx_errors, tx_dropped, tx_errors);
+                  // cache under the requested name, but report the adapter name
+                  result = calcNetworkSpeed(ifaceSanitized, parseInt(rx_bytes), parseInt(tx_bytes), operstate, rx_dropped, rx_errors, tx_dropped, tx_errors);
+                  result.iface = ifaceName;
+                  _network[ifaceSanitized].ifaceName = ifaceName;
                 }
                 resolve(result);
               });
@@ -89268,6 +89461,7 @@ function networkStatsSingle(iface) {
         result.tx_sec = _network[ifaceSanitized].tx_sec;
         result.ms = _network[ifaceSanitized].last_ms;
         result.operstate = _network[ifaceSanitized].operstate;
+        result.iface = _network[ifaceSanitized].ifaceName || ifaceSanitized;
         resolve(result);
       }
     });
@@ -89308,7 +89502,7 @@ function networkConnections(callback) {
             'export LC_ALL=C; netstat -na | grep "ESTABLISHED\\|SYN_SENT\\|SYN_RECV\\|FIN_WAIT1\\|FIN_WAIT2\\|TIME_WAIT\\|CLOSE\\|CLOSE_WAIT\\|LAST_ACK\\|LISTEN\\|CLOSING\\|UNKNOWN"; unset LC_ALL';
         }
         exec(cmd, { maxBuffer: 1024 * 102400 }, (error, stdout) => {
-          let lines = stdout.toString().split('\n');
+          const lines = stdout.toString().split('\n');
           if (!error && (lines.length > 1 || lines[0] !== '')) {
             lines.forEach((line) => {
               line = line.replace(/ +/g, ' ').split(' ');
@@ -89497,11 +89691,11 @@ function networkConnections(callback) {
         });
       }
       if (_windows) {
-        let cmd = 'netstat -nao';
+        const cmd = 'netstat -nao';
         try {
           exec(cmd, util.execOptsWin, (error, stdout) => {
             if (!error) {
-              let lines = stdout.toString().split('\r\n');
+              const lines = stdout.toString().split('\r\n');
 
               lines.forEach((line) => {
                 line = line.trim().replace(/ +/g, ' ').split(' ');
@@ -89612,7 +89806,7 @@ function networkGatewayDefault(callback) {
         try {
           exec(cmd, { maxBuffer: 1024 * 102400 }, (error, stdout) => {
             if (!error) {
-              let lines = stdout.toString().split('\n');
+              const lines = stdout.toString().split('\n');
               const line = lines && lines[0] ? lines[0] : '';
               let parts = line.split(' via ');
               if (parts && parts[1]) {
@@ -89692,7 +89886,7 @@ function networkGatewayDefault(callback) {
             });
             if (!result) {
               util.powerShell("Get-CimInstance -ClassName Win32_IP4RouteTable | Where-Object { $_.Destination -eq '0.0.0.0' -and $_.Mask -eq '0.0.0.0' }").then((data) => {
-                let lines = data.toString().split('\r\n');
+                const lines = data.toString().split('\r\n');
                 if (lines.length > 1 && !result) {
                   result = util.getValue(lines, 'NextHop');
                   if (callback) {
@@ -89762,7 +89956,6 @@ const fs = __nccwpck_require__(7147);
 const util = __nccwpck_require__(5386);
 const exec = (__nccwpck_require__(2081).exec);
 const execSync = (__nccwpck_require__(2081).execSync);
-const execFile = (__nccwpck_require__(2081).execFile);
 
 const _platform = process.platform;
 
@@ -90080,6 +90273,7 @@ function osInfo(callback) {
           result.codename = result.release.startsWith('14.') ? 'Sonoma' : result.codename;
           result.codename = result.release.startsWith('15.') ? 'Sequoia' : result.codename;
           result.codename = result.release.startsWith('26.') ? 'Tahoe' : result.codename;
+          result.codename = result.release.startsWith('27.') ? 'Golden Gate' : result.codename;
           result.uefi = true;
           result.codepage = util.getCodepage();
           if (callback) {
@@ -90518,78 +90712,47 @@ function versions(apps, callback) {
           });
         }
         if ({}.hasOwnProperty.call(appsObj.versions, 'postgresql')) {
-          if (_linux) {
-            exec('locate bin/postgres', (error, stdout) => {
-              if (!error) {
-                const safePath = /^[a-zA-Z0-9/_.-]+$/;
-                const postgresqlBin = stdout
-                  .toString()
-                  .split('\n')
-                  .filter((p) => safePath.test(p.trim()))
-                  .sort();
-                if (postgresqlBin.length) {
-                  execFile(postgresqlBin[postgresqlBin.length - 1], ['-V'], (error, stdout) => {
-                    if (!error) {
-                      const postgresql = stdout.toString().split('\n')[0].split(' ') || [];
-                      appsObj.versions.postgresql = postgresql.length ? postgresql[postgresql.length - 1] : '';
+          if (_windows) {
+            util.powerShell('Get-CimInstance Win32_Service | select caption | fl').then((stdout) => {
+              let serviceSections = stdout.split(/\n\s*\n/);
+              serviceSections.forEach((item) => {
+                if (item.trim() !== '') {
+                  let lines = item.trim().split('\r\n');
+                  let srvCaption = util.getValue(lines, 'caption', ':', true).toLowerCase();
+                  if (srvCaption.indexOf('postgresql') > -1) {
+                    const parts = srvCaption.split(' server ');
+                    if (parts.length > 1) {
+                      appsObj.versions.postgresql = parts[1];
                     }
-                    functionProcessed();
-                  });
-                } else {
-                  functionProcessed();
-                }
-              } else {
-                exec('psql -V', (error, stdout) => {
-                  if (!error) {
-                    const postgresql = stdout.toString().split('\n')[0].split(' ') || [];
-                    appsObj.versions.postgresql = postgresql.length ? postgresql[postgresql.length - 1] : '';
-                    appsObj.versions.postgresql = appsObj.versions.postgresql.split('-')[0];
                   }
-                  functionProcessed();
-                });
-              }
+                }
+              });
+              functionProcessed();
             });
           } else {
-            if (_windows) {
-              util.powerShell('Get-CimInstance Win32_Service | select caption | fl').then((stdout) => {
-                let serviceSections = stdout.split(/\n\s*\n/);
-                serviceSections.forEach((item) => {
-                  if (item.trim() !== '') {
-                    let lines = item.trim().split('\r\n');
-                    let srvCaption = util.getValue(lines, 'caption', ':', true).toLowerCase();
-                    if (srvCaption.indexOf('postgresql') > -1) {
-                      const parts = srvCaption.split(' server ');
-                      if (parts.length > 1) {
-                        appsObj.versions.postgresql = parts[1];
-                      }
-                    }
-                  }
-                });
-                functionProcessed();
-              });
-            } else {
-              exec('postgres -V', (error, stdout) => {
-                if (!error) {
-                  const postgresql = stdout.toString().split('\n')[0].split(' ') || [];
-                  appsObj.versions.postgresql = postgresql.length ? postgresql[postgresql.length - 1] : '';
-                  if (appsObj.versions.postgresql.includes('(') && postgresql.length >= 2 && !postgresql[postgresql.length - 2].includes('(')) {
-                    appsObj.versions.postgresql = postgresql[postgresql.length - 2];
-                  }
+            const parsePostgres = (stdout) => {
+              const postgresql = stdout.toString().split('\n')[0].split(' ') || [];
+              let version = postgresql.length ? postgresql[postgresql.length - 1] : '';
+              if (version.includes('(') && postgresql.length >= 2 && !postgresql[postgresql.length - 2].includes('(')) {
+                version = postgresql[postgresql.length - 2];
+              }
+              return version.split('-')[0];
+            };
+            // no `locate`: its output is any user-writable path and must not be executed
+            const tryPostgres = (cmds) => {
+              if (!cmds.length) {
+                return functionProcessed();
+              }
+              exec(cmds[0], (error, stdout) => {
+                if (!error && stdout.toString().trim()) {
+                  appsObj.versions.postgresql = parsePostgres(stdout);
                   functionProcessed();
                 } else {
-                  exec('pg_config --version', (error, stdout) => {
-                    if (!error) {
-                      const postgresql = stdout.toString().split('\n')[0].split(' ') || [];
-                      appsObj.versions.postgresql = postgresql.length ? postgresql[postgresql.length - 1] : '';
-                      if (appsObj.versions.postgresql.includes('(') && postgresql.length >= 2 && !postgresql[postgresql.length - 2].includes('(')) {
-                        appsObj.versions.postgresql = postgresql[postgresql.length - 2];
-                      }
-                    }
-                    functionProcessed();
-                  });
+                  tryPostgres(cmds.slice(1));
                 }
               });
-            }
+            };
+            tryPostgres(['postgres -V', 'pg_config --version', 'psql -V']);
           }
         }
         if ({}.hasOwnProperty.call(appsObj.versions, 'perl')) {
@@ -90939,16 +91102,30 @@ function shell(callback) {
 
 exports.shell = shell;
 
+// macOS 26+ and some hardened linux kernels mask MACs in getifaddrs()
+const MASKED_MACS = ['00:00:00:00:00:00', '02:00:00:00:00:00'];
+
 function getUniqueMacAdresses() {
   let macs = [];
   try {
     const ifaces = os.networkInterfaces();
+    let fallbackMacs = null;
     for (let dev in ifaces) {
       if ({}.hasOwnProperty.call(ifaces, dev)) {
         ifaces[dev].forEach((details) => {
-          if (details && details.mac && details.mac !== '00:00:00:00:00:00') {
-            const mac = details.mac.toLowerCase();
-            if (macs.indexOf(mac) === -1) {
+          if (details && details.mac) {
+            let mac = details.mac.toLowerCase();
+            if (MASKED_MACS.indexOf(mac) >= 0) {
+              if (fallbackMacs === null) {
+                try {
+                  fallbackMacs = (__nccwpck_require__(4525).getMacAddresses)();
+                } catch {
+                  fallbackMacs = {};
+                }
+              }
+              mac = (fallbackMacs[dev] || '').toLowerCase();
+            }
+            if (mac && MASKED_MACS.indexOf(mac) === -1 && macs.indexOf(mac) === -1) {
               macs.push(mac);
             }
           }
@@ -91311,7 +91488,7 @@ const execSync = (__nccwpck_require__(2081).execSync);
 
 const util = __nccwpck_require__(5386);
 
-let _platform = process.platform;
+const _platform = process.platform;
 
 const _linux = _platform === 'linux' || _platform === 'android';
 const _darwin = _platform === 'darwin';
@@ -91361,7 +91538,7 @@ const _winStatusValues = {
 
 function parseTimeUnix(time) {
   let result = time;
-  let parts = time.replace(/ +/g, ' ').split(' ');
+  const parts = time.replace(/ +/g, ' ').split(' ');
   if (parts.length === 5) {
     result = parts[4] + '-' + ('0' + ('JANFEBMARAPRMAYJUNJULAUGSEPOCTNOVDEC'.indexOf(parts[1].toUpperCase()) / 3 + 1)).slice(-2) + '-' + ('0' + parts[2]).slice(-2) + ' ' + parts[3];
   }
@@ -91445,8 +91622,8 @@ function services(srv, callback) {
           srvString = '------';
         }
         let srvs = srvString.split('|');
-        let result = [];
-        let dataSrv = [];
+        const result = [];
+        const dataSrv = [];
 
         if (_linux || _freebsd || _openbsd || _netbsd || _darwin) {
           if ((_linux || _freebsd || _openbsd || _netbsd) && srvString === '*') {
@@ -91503,23 +91680,20 @@ function services(srv, callback) {
           if (srvString !== '' && srvs.length > 0) {
             util.execSafe('ps', args).then((stdout) => {
               if (stdout) {
-                let lines = stdout.replace(/ +/g, ' ').replace(/,+/g, '.').split('\n');
-                srvs.forEach(function (srv) {
+                const lines = stdout.replace(/ +/g, ' ').replace(/,+/g, '.').split('\n');
+                srvs.forEach((srv) => {
                   let ps;
                   if (_darwin) {
-                    ps = lines.filter(function (e) {
-                      return e.toLowerCase().indexOf(srv) !== -1;
-                    });
+                    ps = lines.filter((e) => e.toLowerCase().indexOf(srv) !== -1);
                   } else {
-                    ps = lines.filter(function (e) {
-                      return (
+                    ps = lines.filter(
+                      (e) =>
                         e.toLowerCase().indexOf(' ' + srv.toLowerCase() + ':') !== -1 ||
                         e.toLowerCase().indexOf('(' + srv.toLowerCase() + ' ') !== -1 ||
                         e.toLowerCase().indexOf('(' + srv.toLowerCase() + ')') !== -1 ||
                         e.toLowerCase().indexOf(' ' + srv.toLowerCase().replace(/[0-9.]/g, '') + ':') !== -1 ||
                         e.toLowerCase().indexOf('/' + srv.toLowerCase()) !== -1
-                      );
-                    });
+                    );
                   }
                   const pids = [];
                   for (const p of ps) {
@@ -91533,46 +91707,42 @@ function services(srv, callback) {
                     running: ps.length > 0,
                     startmode: '',
                     pids: pids,
-                    cpu: parseFloat(
-                      ps
-                        .reduce(function (pv, cv) {
-                          return pv + parseFloat(cv.trim().split(' ')[0]);
-                        }, 0)
-                        .toFixed(2)
-                    ),
-                    mem: parseFloat(
-                      ps
-                        .reduce(function (pv, cv) {
-                          return pv + parseFloat(cv.trim().split(' ')[1]);
-                        }, 0)
-                        .toFixed(2)
-                    )
+                    cpu: parseFloat(ps.reduce((pv, cv) => pv + parseFloat(cv.trim().split(' ')[0]), 0).toFixed(2)),
+                    mem: parseFloat(ps.reduce((pv, cv) => pv + parseFloat(cv.trim().split(' ')[1]), 0).toFixed(2))
                   });
                 });
                 if (_linux) {
                   // calc process_cpu - ps is not accurate in linux!
+                  // ps pcpu is a lifetime average, the /proc values below are an interval share -
+                  // drop the ps seed instead of adding both (#1007)
+                  result.forEach((item) => {
+                    item.cpu = 0;
+                  });
                   let cmd = 'cat /proc/stat | grep "cpu "';
-                  for (let i in result) {
-                    for (let j in result[i].pids) {
+                  for (const i in result) {
+                    for (const j in result[i].pids) {
                       cmd += ';cat /proc/' + result[i].pids[j] + '/stat';
                     }
                   }
-                  exec(cmd, { maxBuffer: 1024 * 102400 }, function (error, stdout) {
-                    let curr_processes = stdout.toString().split('\n');
+                  // freeze the baseline before the async call - a concurrent call overwrites _services_cpu
+                  // and would leave this one dividing by a few jiffies (#1007)
+                  const cpuBaseline = Object.assign({}, _services_cpu);
+                  exec(cmd, { maxBuffer: 1024 * 102400 }, (error, stdout) => {
+                    const curr_processes = stdout.toString().split('\n');
 
                     // first line (all - /proc/stat)
-                    let all = parseProcStat(curr_processes.shift());
+                    const all = parseProcStat(curr_processes.shift());
 
                     // process
-                    let list_new = {};
+                    const list_new = {};
                     let resultProcess = {};
                     curr_processes.forEach((element) => {
-                      resultProcess = calcProcStatLinux(element, all, _services_cpu);
+                      resultProcess = calcProcStatLinux(element, all, cpuBaseline);
 
                       if (resultProcess.pid) {
                         let listPos = -1;
-                        for (let i in result) {
-                          for (let j in result[i].pids) {
+                        for (const i in result) {
+                          for (const j in result[i].pids) {
                             if (parseInt(result[i].pids[j]) === parseInt(resultProcess.pid)) {
                               listPos = i;
                             }
@@ -91587,9 +91757,7 @@ function services(srv, callback) {
                           cpuu: resultProcess.cpuu,
                           cpus: resultProcess.cpus,
                           utime: resultProcess.utime,
-                          stime: resultProcess.stime,
-                          cutime: resultProcess.cutime,
-                          cstime: resultProcess.cstime
+                          stime: resultProcess.stime
                         };
                       }
                     });
@@ -91614,11 +91782,9 @@ function services(srv, callback) {
                 args = ['-o', 'comm'];
                 util.execSafe('ps', args).then((stdout) => {
                   if (stdout) {
-                    let lines = stdout.replace(/ +/g, ' ').replace(/,+/g, '.').split('\n');
-                    srvs.forEach(function (srv) {
-                      let ps = lines.filter(function (e) {
-                        return e.indexOf(srv) !== -1;
-                      });
+                    const lines = stdout.replace(/ +/g, ' ').replace(/,+/g, '.').split('\n');
+                    srvs.forEach((srv) => {
+                      const ps = lines.filter((e) => e.indexOf(srv) !== -1);
                       result.push({
                         name: srv,
                         running: ps.length > 0,
@@ -91632,7 +91798,7 @@ function services(srv, callback) {
                     }
                     resolve(result);
                   } else {
-                    srvs.forEach(function (srv) {
+                    srvs.forEach((srv) => {
                       result.push({
                         name: srv,
                         running: false,
@@ -91661,22 +91827,23 @@ function services(srv, callback) {
             if (srvs[0] !== '*') {
               wincommand += ' -Filter "';
               srvs.forEach((srv) => {
-                wincommand += `Name='${srv}' or `;
+                // whitelist: srv is inserted into a PowerShell string
+                wincommand += `Name='${srv.replace(/[^a-zA-Z0-9 _.\-@]/g, '')}' or `;
               });
               wincommand = `${wincommand.slice(0, -4)}"`;
             }
             wincommand += ' | select Name,Caption,Started,StartMode,ProcessId | fl';
             util.powerShell(wincommand).then((stdout, error) => {
               if (!error) {
-                let serviceSections = stdout.split(/\n\s*\n/);
+                const serviceSections = stdout.split(/\n\s*\n/);
                 serviceSections.forEach((element) => {
                   if (element.trim() !== '') {
-                    let lines = element.trim().split('\r\n');
-                    let srvName = util.getValue(lines, 'Name', ':', true).toLowerCase();
-                    let srvCaption = util.getValue(lines, 'Caption', ':', true).toLowerCase();
-                    let started = util.getValue(lines, 'Started', ':', true);
-                    let startMode = util.getValue(lines, 'StartMode', ':', true);
-                    let pid = util.getValue(lines, 'ProcessId', ':', true);
+                    const lines = element.trim().split('\r\n');
+                    const srvName = util.getValue(lines, 'Name', ':', true).toLowerCase();
+                    const srvCaption = util.getValue(lines, 'Caption', ':', true).toLowerCase();
+                    const started = util.getValue(lines, 'Started', ':', true);
+                    const startMode = util.getValue(lines, 'StartMode', ':', true);
+                    const pid = util.getValue(lines, 'ProcessId', ':', true);
                     if (srvString === '*' || srvs.indexOf(srvName) >= 0 || srvs.indexOf(srvCaption) >= 0) {
                       result.push({
                         name: srvName,
@@ -91764,43 +91931,59 @@ function parseProcStat(line) {
   return user + nice + system + idle + iowait + irq + softirq + steal + guest + guest_nice;
 }
 
-function calcProcStatLinux(line, all, _cpu_old) {
-  let statparts = line.replace(/ +/g, ' ').split(')');
-  if (statparts.length >= 2) {
-    let parts = statparts[1].split(' ');
-    if (parts.length >= 16) {
-      let pid = parseInt(statparts[0].split(' ')[0]);
-      let utime = parseInt(parts[12]);
-      let stime = parseInt(parts[13]);
-      let cutime = parseInt(parts[14]);
-      let cstime = parseInt(parts[15]);
+// drops NaN/Infinity/negative values and scales cpuu + cpus down proportionally
+// if their sum exceeds 100 (normalized against all cores)
+function clampCpuPair(cpuu, cpus) {
+  if (!isFinite(cpuu) || cpuu < 0) {
+    cpuu = 0;
+  }
+  if (!isFinite(cpus) || cpus < 0) {
+    cpus = 0;
+  }
+  const total = cpuu + cpus;
+  if (total > 100) {
+    cpuu = (cpuu / total) * 100;
+    cpus = (cpus / total) * 100;
+  }
+  return { cpuu: cpuu, cpus: cpus };
+}
 
-      // calc
+function calcProcStatLinux(line, all, _cpu_old) {
+  const statparts = line.replace(/ +/g, ' ').split(')');
+  if (statparts.length >= 2) {
+    const parts = statparts[1].split(' ');
+    if (parts.length >= 16) {
+      const pid = parseInt(statparts[0].split(' ')[0]);
+      const utime = parseInt(parts[12]);
+      const stime = parseInt(parts[13]);
+
+      // calc - child times (cutime/cstime) are deliberately left out: reaping a child adds its
+      // whole lifetime in one interval, which is what produced the >100% spikes in #1007.
+      // top, htop and Task Manager exclude them too.
       let cpuu = 0;
       let cpus = 0;
       if (_cpu_old.all > 0 && _cpu_old.list[pid]) {
-        cpuu = ((utime + cutime - _cpu_old.list[pid].utime - _cpu_old.list[pid].cutime) / (all - _cpu_old.all)) * 100; // user
-        cpus = ((stime + cstime - _cpu_old.list[pid].stime - _cpu_old.list[pid].cstime) / (all - _cpu_old.all)) * 100; // system
+        const delta = all - _cpu_old.all;
+        cpuu = delta > 0 ? ((utime - _cpu_old.list[pid].utime) / delta) * 100 : 0; // user
+        cpus = delta > 0 ? ((stime - _cpu_old.list[pid].stime) / delta) * 100 : 0; // system
       } else {
-        cpuu = ((utime + cutime) / all) * 100; // user
-        cpus = ((stime + cstime) / all) * 100; // system
+        cpuu = all > 0 ? (utime / all) * 100 : 0; // user
+        cpus = all > 0 ? (stime / all) * 100 : 0; // system
       }
+      // normalized against all cores, so 100 is the ceiling for cpuu + cpus
+      const clamped = clampCpuPair(cpuu, cpus);
       return {
         pid: pid,
         utime: utime,
         stime: stime,
-        cutime: cutime,
-        cstime: cstime,
-        cpuu: cpuu,
-        cpus: cpus
+        cpuu: clamped.cpuu,
+        cpus: clamped.cpus
       };
     } else {
       return {
         pid: 0,
         utime: 0,
         stime: 0,
-        cutime: 0,
-        cstime: 0,
         cpuu: 0,
         cpus: 0
       };
@@ -91810,8 +91993,6 @@ function calcProcStatLinux(line, all, _cpu_old) {
       pid: 0,
       utime: 0,
       stime: 0,
-      cutime: 0,
-      cstime: 0,
       cpuu: 0,
       cpus: 0
     };
@@ -91823,18 +92004,21 @@ function calcProcStatWin(procStat, all, _cpu_old) {
   let cpuu = 0;
   let cpus = 0;
   if (_cpu_old.all > 0 && _cpu_old.list[procStat.pid]) {
-    cpuu = ((procStat.utime - _cpu_old.list[procStat.pid].utime) / (all - _cpu_old.all)) * 100; // user
-    cpus = ((procStat.stime - _cpu_old.list[procStat.pid].stime) / (all - _cpu_old.all)) * 100; // system
+    const delta = all - _cpu_old.all;
+    cpuu = delta > 0 ? ((procStat.utime - _cpu_old.list[procStat.pid].utime) / delta) * 100 : 0; // user
+    cpus = delta > 0 ? ((procStat.stime - _cpu_old.list[procStat.pid].stime) / delta) * 100 : 0; // system
   } else {
-    cpuu = (procStat.utime / all) * 100; // user
-    cpus = (procStat.stime / all) * 100; // system
+    cpuu = all > 0 ? (procStat.utime / all) * 100 : 0; // user
+    cpus = all > 0 ? (procStat.stime / all) * 100 : 0; // system
   }
+  // same ceiling as the linux path - cpuu + cpus stays inside [0, 100] (#1007)
+  const clamped = clampCpuPair(cpuu, cpus);
   return {
     pid: procStat.pid,
     utime: procStat.utime,
     stime: procStat.stime,
-    cpuu: cpuu > 0 ? cpuu : 0,
-    cpus: cpus > 0 ? cpus : 0
+    cpuu: clamped.cpuu,
+    cpus: clamped.cpus
   };
 }
 
@@ -91851,7 +92035,7 @@ function processes(callback) {
       result = result.substr(0, result.length - 1);
     }
     if (result.substr(0, 1) !== '[') {
-      let parts = result.split('/');
+      const parts = result.split('/');
       if (isNaN(parseInt(parts[parts.length - 1]))) {
         result = parts[parts.length - 1];
       } else {
@@ -91927,6 +92111,11 @@ function processes(callback) {
     let command = '';
     let params = '';
     let fullcommand = line.substring(parsedhead[12].from + offset, parsedhead[12].to + offset2).trim();
+    // zombies are printed as "[name] <defunct>" - drop the marker so the bracket handling below
+    // sees a plain "[name]" and does not leak "] <defunct>" into command and name
+    if (fullcommand.endsWith(' <defunct>')) {
+      fullcommand = fullcommand.slice(0, -10).trim();
+    }
     if (fullcommand.substr(fullcommand.length - 1) === ']') {
       fullcommand = fullcommand.slice(0, -1);
     }
@@ -91999,9 +92188,9 @@ function processes(callback) {
   }
 
   function parseProcesses(lines) {
-    let result = [];
+    const result = [];
     if (lines.length > 1) {
-      let head = lines[0];
+      const head = lines[0];
       parsedhead = util.parseHead(head, 8);
       lines.shift();
       lines.forEach((line) => {
@@ -92050,7 +92239,7 @@ function processes(callback) {
       return started;
     }
 
-    let result = [];
+    const result = [];
     lines.forEach((line) => {
       if (line.trim() !== '') {
         line = line.trim().replace(/ +/g, ' ').replace(/,+/g, '.');
@@ -92099,7 +92288,7 @@ function processes(callback) {
 
   return new Promise((resolve) => {
     process.nextTick(() => {
-      let result = {
+      const result = {
         all: 0,
         running: 0,
         blocked: 0,
@@ -92145,21 +92334,24 @@ function processes(callback) {
                   result.list.forEach((element) => {
                     cmd += ';cat /proc/' + element.pid + '/stat';
                   });
+                  // freeze the baseline before the async call - a concurrent call overwrites _processes_cpu
+                  // and would leave this one dividing by a few jiffies (#1007)
+                  const cpuBaseline = Object.assign({}, _processes_cpu);
                   exec(cmd, { maxBuffer: 1024 * 102400 }, (error, stdout) => {
-                    let curr_processes = stdout.toString().split('\n');
+                    const curr_processes = stdout.toString().split('\n');
 
                     // first line (all - /proc/stat)
-                    let all = parseProcStat(curr_processes.shift());
+                    const all = parseProcStat(curr_processes.shift());
 
                     // process
-                    let list_new = {};
+                    const list_new = {};
                     let resultProcess = {};
                     curr_processes.forEach((element) => {
-                      resultProcess = calcProcStatLinux(element, all, _processes_cpu);
+                      resultProcess = calcProcStatLinux(element, all, cpuBaseline);
 
                       if (resultProcess.pid) {
                         // store pcpu in outer array
-                        let listPos = result.list
+                        const listPos = result.list
                           .map((e) => {
                             return e.pid;
                           })
@@ -92175,9 +92367,7 @@ function processes(callback) {
                           cpuu: resultProcess.cpuu,
                           cpus: resultProcess.cpus,
                           utime: resultProcess.utime,
-                          stime: resultProcess.stime,
-                          cutime: resultProcess.cutime,
-                          cstime: resultProcess.cstime
+                          stime: resultProcess.stime
                         };
                       }
                     });
@@ -92205,7 +92395,7 @@ function processes(callback) {
                 }
                 exec(cmd, { maxBuffer: 1024 * 102400 }, (error, stdout) => {
                   if (!error) {
-                    let lines = stdout.toString().split('\n');
+                    const lines = stdout.toString().split('\n');
                     lines.shift();
 
                     result.list = parseProcesses2(lines).slice();
@@ -92240,6 +92430,9 @@ function processes(callback) {
           }
         } else if (_windows) {
           try {
+            // freeze the baseline before the async call - a concurrent call overwrites _processes_cpu
+            // and would leave this one with a non positive delta (#1007)
+            const cpuBaseline = Object.assign({}, _processes_cpu);
             util
               .powerShell(
                 `Get-CimInstance Win32_Process | select-Object ProcessId,ParentProcessId,ExecutionState,Caption,CommandLine,ExecutablePath,UserModeTime,KernelModeTime,WorkingSetSize,Priority,PageFileUsage,
@@ -92250,8 +92443,10 @@ function processes(callback) {
                   const procs = [];
                   const procStats = [];
                   const list_new = {};
-                  let allcpuu = 0;
-                  let allcpus = 0;
+                  // accumulate from the previous totals and add deltas only - a process that exited
+                  // must not lower the total, otherwise the denominator turns negative (#559)
+                  let allcpuu = cpuBaseline.all_utime;
+                  let allcpus = cpuBaseline.all_stime;
                   let processArray = [];
                   try {
                     stdout = stdout.trim().replace(/^\uFEFF/, '');
@@ -92271,8 +92466,9 @@ function processes(callback) {
                     const utime = element.UserModeTime;
                     const stime = element.KernelModeTime;
                     const memw = element.WorkingSetSize;
-                    allcpuu = allcpuu + utime;
-                    allcpus = allcpus + stime;
+                    const cpuOld = cpuBaseline.list[pid];
+                    allcpuu += utime - (cpuOld ? cpuOld.utime : 0);
+                    allcpus += stime - (cpuOld ? cpuOld.stime : 0);
                     result.all++;
                     if (!statusValue) {
                       result.unknown++;
@@ -92317,10 +92513,10 @@ function processes(callback) {
                   result.sleeping = result.all - result.running - result.blocked - result.unknown;
                   result.list = procs;
                   procStats.forEach((element) => {
-                    let resultProcess = calcProcStatWin(element, allcpuu + allcpus, _processes_cpu);
+                    const resultProcess = calcProcStatWin(element, allcpuu + allcpus, cpuBaseline);
 
                     // store pcpu in outer array
-                    let listPos = result.list.map((e) => e.pid).indexOf(resultProcess.pid);
+                    const listPos = result.list.map((e) => e.pid).indexOf(resultProcess.pid);
                     if (listPos >= 0) {
                       result.list[listPos].cpu = resultProcess.cpuu + resultProcess.cpus;
                       result.list[listPos].cpuu = resultProcess.cpuu;
@@ -92425,8 +92621,8 @@ function processLoad(proc, callback) {
       if (util.isPrototypePolluted() && processesString !== '*') {
         processesString = '------';
       }
-      let processes = processesString.split('|');
-      let result = [];
+      const processes = processesString.split('|');
+      const result = [];
 
       const procSanitized = util.isPrototypePolluted() ? '' : util.sanitizeShellString(proc) || '*';
 
@@ -92440,12 +92636,16 @@ function processLoad(proc, callback) {
       if (procSanitized && processes.length && processes[0] !== '------') {
         if (_windows) {
           try {
+            // freeze the baseline before the async call - a concurrent call overwrites _process_cpu
+            // and would leave this one with a non positive delta (#1007)
+            const cpuBaseline = Object.assign({}, _process_cpu);
             util.powerShell('Get-CimInstance Win32_Process | select ProcessId,Caption,UserModeTime,KernelModeTime,WorkingSetSize | ConvertTo-Json -compress').then((stdout, error) => {
               if (!error) {
                 const procStats = [];
                 const list_new = {};
-                let allcpuu = 0;
-                let allcpus = 0;
+                // see processes() - never lower the total when a process exits (#559)
+                let allcpuu = cpuBaseline.all_utime;
+                let allcpus = cpuBaseline.all_stime;
                 let processArray = [];
                 try {
                   stdout = stdout.trim().replace(/^\uFEFF/, '');
@@ -92462,8 +92662,9 @@ function processLoad(proc, callback) {
                   const utime = element.UserModeTime;
                   const stime = element.KernelModeTime;
                   const mem = element.WorkingSetSize;
-                  allcpuu = allcpuu + utime;
-                  allcpus = allcpus + stime;
+                  const cpuOld = cpuBaseline.list[pid];
+                  allcpuu += utime - (cpuOld ? cpuOld.utime : 0);
+                  allcpus += stime - (cpuOld ? cpuOld.stime : 0);
 
                   procStats.push({
                     pid: pid,
@@ -92507,7 +92708,7 @@ function processLoad(proc, callback) {
 
                 if (processesString !== '*') {
                   // add missing processes
-                  let processesMissing = processes.filter((name) => procStats.filter((item) => item.name.toLowerCase().indexOf(name) >= 0).length === 0);
+                  const processesMissing = processes.filter((name) => procStats.filter((item) => item.name.toLowerCase().indexOf(name) >= 0).length === 0);
                   processesMissing.forEach((procName) => {
                     result.push({
                       proc: procName,
@@ -92521,7 +92722,7 @@ function processLoad(proc, callback) {
 
                 // calculate proc stats for each proc
                 procStats.forEach((element) => {
-                  let resultProcess = calcProcStatWin(element, allcpuu + allcpus, _process_cpu);
+                  const resultProcess = calcProcStatWin(element, allcpuu + allcpus, cpuBaseline);
 
                   let listPos = -1;
                   for (let j = 0; j < result.length; j++) {
@@ -92639,7 +92840,7 @@ function processLoad(proc, callback) {
 
               if (processesString !== '*') {
                 // add missing processes
-                let processesMissing = processes.filter((name) => {
+                const processesMissing = processes.filter((name) => {
                   return (
                     procStats.filter((item) => {
                       return item.name.toLowerCase().indexOf(name) >= 0;
@@ -92662,27 +92863,30 @@ function processLoad(proc, callback) {
                   item.cpu = 0;
                 });
                 let cmd = 'cat /proc/stat | grep "cpu "';
-                for (let i in result) {
-                  for (let j in result[i].pids) {
+                for (const i in result) {
+                  for (const j in result[i].pids) {
                     cmd += ';cat /proc/' + result[i].pids[j] + '/stat';
                   }
                 }
+                // freeze the baseline before the async call - a concurrent call overwrites _process_cpu
+                // and would leave this one dividing by a few jiffies (#1007)
+                const cpuBaseline = Object.assign({}, _process_cpu);
                 exec(cmd, { maxBuffer: 1024 * 102400 }, (error, stdout) => {
-                  let curr_processes = stdout.toString().split('\n');
+                  const curr_processes = stdout.toString().split('\n');
 
                   // first line (all - /proc/stat)
-                  let all = parseProcStat(curr_processes.shift());
+                  const all = parseProcStat(curr_processes.shift());
 
                   // process
-                  let list_new = {};
+                  const list_new = {};
                   let resultProcess = {};
                   curr_processes.forEach((element) => {
-                    resultProcess = calcProcStatLinux(element, all, _process_cpu);
+                    resultProcess = calcProcStatLinux(element, all, cpuBaseline);
 
                     if (resultProcess.pid) {
                       // find result item
                       let resultItemId = -1;
-                      for (let i in result) {
+                      for (const i in result) {
                         if (result[i].pids.indexOf(resultProcess.pid) >= 0) {
                           resultItemId = i;
                         }
@@ -92697,9 +92901,7 @@ function processLoad(proc, callback) {
                         cpuu: resultProcess.cpuu,
                         cpus: resultProcess.cpus,
                         utime: resultProcess.utime,
-                        stime: resultProcess.stime,
-                        cutime: resultProcess.cutime,
-                        cstime: resultProcess.cstime
+                        stime: resultProcess.stime
                       };
                     }
                   });
@@ -94112,7 +94314,7 @@ function users(callback) {
 
       // linux
       if (_linux) {
-        exec('export LC_ALL=C; who --ips; echo "---"; w; unset LC_ALL | tail -n +2', (error, stdout) => {
+        exec('export LC_ALL=C; who --ips; echo "---"; w | tail -n +2', (error, stdout) => {
           if (!error) {
             // lines / split
             let lines = stdout.toString().split('\n');
@@ -94452,7 +94654,7 @@ const stringStartWith = new String().startsWith;
 const mathMin = Math.min;
 
 function isFunction(functionToCheck) {
-  let getType = {};
+  const getType = {};
   return functionToCheck && getType.toString.call(functionToCheck) === '[object Function]';
 }
 
@@ -94460,7 +94662,7 @@ function unique(obj) {
   const uniques = [];
   const stringify = {};
   for (let i = 0; i < obj.length; i++) {
-    let keys = Object.keys(obj[i]);
+    const keys = Object.keys(obj[i]);
     keys.sort((a, b) => {
       return a - b;
     });
@@ -94559,7 +94761,14 @@ function parseTime(t, pmDesignator) {
       parts[1] += parts[2];
     }
     const p1 = (parts[1] || '').toLowerCase();
-    let isPM = p1.indexOf('pm') > -1 || p1.indexOf('p.m.') > -1 || p1.indexOf('p. m.') > -1 || p1.indexOf('n') > -1 || p1.indexOf('ch') > -1 || p1.indexOf('ös') > -1 || (pmDesignator && p1.indexOf(pmDesignator) > -1);
+    const isPM =
+      p1.indexOf('pm') > -1 ||
+      p1.indexOf('p.m.') > -1 ||
+      p1.indexOf('p. m.') > -1 ||
+      p1.indexOf('n') > -1 ||
+      p1.indexOf('ch') > -1 ||
+      p1.indexOf('ös') > -1 ||
+      (pmDesignator && p1.indexOf(pmDesignator) > -1);
     hour = parseInt(parts[0], 10);
     min = parseInt(parts[1], 10);
     hour = isPM && hour < 12 ? hour + 12 : hour;
@@ -94762,9 +94971,12 @@ function powerShellStart() {
       _psPersistent = true;
       _psChild.stdout.on('data', (data) => {
         _psResult = _psResult + data.toString('utf8');
-        if (data.indexOf(_psCmdSeperator) >= 0) {
-          powerShellProceedResults(_psResult);
-          _psResult = '';
+        let sepIndex = _psResult.indexOf(_psCmdSeperator);
+        while (sepIndex >= 0) {
+          const end = sepIndex + _psCmdSeperator.length;
+          powerShellProceedResults(_psResult.slice(0, end));
+          _psResult = _psResult.slice(end);
+          sepIndex = _psResult.indexOf(_psCmdSeperator);
         }
       });
       _psChild.stderr.on('data', () => {
@@ -95017,7 +95229,7 @@ function execWin(cmd, opts, callback) {
     callback = opts;
     opts = execOptsWin;
   }
-  let newCmd = 'chcp 65001 > nul && cmd /C ' + cmd + ' && chcp ' + codepage + ' > nul';
+  const newCmd = 'chcp 65001 > nul && cmd /C ' + cmd + ' && chcp ' + codepage + ' > nul';
   exec(newCmd, opts, (error, stdout) => {
     callback(error, stdout);
   });
@@ -95096,6 +95308,9 @@ function sanitizeShellString(str, strict) {
         s[i] === "'" ||
         s[i] === '`' ||
         s[i] === '"' ||
+        // unicode quotes (U+2018-U+201E) and dashes (U+2013-U+2015) are treated as ' " - by PowerShell
+        (s[i] >= '‘' && s[i] <= '„') ||
+        (s[i] >= '–' && s[i] <= '―') ||
         s[i].length > 1 ||
         (strict && s[i] === '(') ||
         (strict && s[i] === ')') ||
@@ -95117,6 +95332,12 @@ function sanitizeContainerID(str) {
     .substring(0, 2000)
     .replace(/[^a-zA-Z0-9_.,*-]/g, '');
   return s.indexOf('..') === -1 ? s : '';
+}
+
+// windows drive letter whitelist: only "<letter>:" survives, everything else is dropped
+function sanitizeDriveLetter(str) {
+  const match = /^\s*([a-zA-Z]):?[\\/]?\s*$/.exec(String(str || ''));
+  return match ? match[1] + ':' : '';
 }
 
 function sanitizeImageID(str) {
@@ -95459,7 +95680,7 @@ function decodePiCpuinfo(lines) {
       model,
       serial,
       revisionCode,
-      memory: 256 * Math.pow(2, memSizeCode),
+      memory: 256 * 2 ** memSizeCode,
       manufacturer,
       processor,
       type: {}.hasOwnProperty.call(typeList, typeCode) ? typeList[typeCode] : '',
@@ -95578,7 +95799,7 @@ function plistParser(xmlStr) {
   const startStr = '<plist version';
 
   let pos = xmlStr.indexOf(startStr);
-  let len = xmlStr.length;
+  const len = xmlStr.length;
   while (xmlStr[pos] !== '>' && pos < len) {
     pos++;
   }
@@ -95587,7 +95808,7 @@ function plistParser(xmlStr) {
   let inTagStart = false;
   let inTagContent = false;
   let inTagEnd = false;
-  let metaData = [{ tagStart: '', tagEnd: '', tagContent: '', key: '', data: null }];
+  const metaData = [{ tagStart: '', tagEnd: '', tagContent: '', key: '', data: null }];
   let c = '';
   let cn = xmlStr[pos];
 
@@ -95784,8 +96005,42 @@ function semverCompare(v1, v2) {
   return res;
 }
 
+// Mac model name and serial number / model identifier
+
 function getAppleModel(key) {
   const appleModelIds = [
+    {
+      key: 'Mac18,5',
+      name: 'Mac mini',
+      size: '',
+      processor: 'M6',
+      year: '2026',
+      additional: ''
+    },
+    {
+      key: 'Mac17,16',
+      name: 'Mac mini',
+      size: '',
+      processor: 'M5 Pro',
+      year: '2026',
+      additional: ''
+    },
+    {
+      key: 'Mac17,15',
+      name: 'Mac Studio',
+      size: '',
+      processor: 'M5 Ultra',
+      year: '2026',
+      additional: ''
+    },
+    {
+      key: 'Mac17,14',
+      name: 'Mac Studio',
+      size: '',
+      processor: 'M5 Max',
+      year: '2026',
+      additional: ''
+    },
     {
       key: 'Mac17,9',
       name: 'MacBook Pro',
@@ -97068,35 +97323,45 @@ function checkWebsite(url, timeout = 5000) {
   const http = url.startsWith('https:') || url.indexOf(':443/') > 0 || url.indexOf(':8443/') > 0 ? __nccwpck_require__(5687) : __nccwpck_require__(3685);
   const t = Date.now();
   return new Promise((resolve) => {
-    const request = http
-      .get(url, (res) => {
-        res.on('data', () => {});
-        res.on('end', () => {
+    try {
+      const request = http
+        .get(url, (res) => {
+          res.on('data', () => {});
+          res.on('end', () => {
+            resolve({
+              url,
+              statusCode: res.statusCode,
+              message: res.statusMessage,
+              time: Date.now() - t
+            });
+          });
+        })
+        .on('error', (e) => {
           resolve({
             url,
-            statusCode: res.statusCode,
-            message: res.statusMessage,
+            statusCode: 404,
+            message: e.message,
+            time: Date.now() - t
+          });
+        })
+        .setTimeout(timeout, () => {
+          request.destroy();
+          resolve({
+            url,
+            statusCode: 408,
+            message: 'Request Timeout',
             time: Date.now() - t
           });
         });
-      })
-      .on('error', (e) => {
-        resolve({
-          url,
-          statusCode: 404,
-          message: e.message,
-          time: Date.now() - t
-        });
-      })
-      .setTimeout(timeout, () => {
-        request.destroy();
-        resolve({
-          url,
-          statusCode: 408,
-          message: 'Request Timeout',
-          time: Date.now() - t
-        });
+    } catch (e) {
+      // http.get() throws synchronously on invalid URLs
+      resolve({
+        url,
+        statusCode: 404,
+        message: e.message,
+        time: Date.now() - t
       });
+    }
   });
 }
 
@@ -97150,6 +97415,7 @@ exports.sanitizeContainerID = sanitizeContainerID;
 exports.sanitizeImageID = sanitizeImageID;
 exports.isPrototypePolluted = isPrototypePolluted;
 exports.sanitizeString = sanitizeString;
+exports.sanitizeDriveLetter = sanitizeDriveLetter;
 exports.decodePiCpuinfo = decodePiCpuinfo;
 exports.getRpiGpu = getRpiGpu;
 exports.promiseAll = promiseAll;
@@ -97503,7 +97769,7 @@ function ifaceListLinux() {
 }
 
 function nmiDeviceLinux(iface) {
-  const cmd = `nmcli -t -f general,wifi-properties,capabilities,ip4,ip6 device show ${iface} 2> /dev/null`;
+  const cmd = `nmcli -t -f general,wifi-properties,capabilities,ip4,ip6 device show ${util.sanitizeString(iface, true)} 2> /dev/null`;
   try {
     const lines = execSync(cmd, util.execOptsLinux).toString().split('\n');
     const ssid = util.getValue(lines, 'GENERAL.CONNECTION');
@@ -109680,7 +109946,7 @@ module.exports = JSON.parse('{"application/1d-interleaved-parityfec":{"source":"
 /***/ ((module) => {
 
 "use strict";
-module.exports = {"i8":"5.33.1"};
+module.exports = {"i8":"5.33.18"};
 
 /***/ })
 
